@@ -1,6 +1,7 @@
 use anyhow::bail;
 use futures::{FutureExt, SinkExt, StreamExt};
 // use scc::HashMap;
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap as HashMap;
 use itertools::Itertools;
 use std::future::Future;
@@ -41,9 +42,60 @@ use oneshot::channel as query_channel;
 type QueryChannelSender = oneshot::Sender<RawResult<WsRecvData>>;
 // use tokio::sync::mpsc::unbounded_channel as query_channel;
 // type QueryChannelSender = tokio::sync::mpsc::UnboundedSender<Result<WsRecvData, RawError>>;
-type QueryInner = HashMap<ReqId, QueryChannelSender>;
+type QueryInner = HashMap<ReqId, QueryWaiter>;
 type QueryAgent = Arc<QueryInner>;
-type QueryResMapper = HashMap<ResId, ReqId>;
+type QueryResMapper = HashMap<ResId, FetchWaiter>;
+
+#[derive(Debug)]
+struct QueryWaiter {
+    registration: Arc<()>,
+    sender: QueryChannelSender,
+}
+
+impl QueryWaiter {
+    fn send(self, response: RawResult<WsRecvData>) -> Result<(), RawResult<WsRecvData>> {
+        self.sender.send(response)
+    }
+}
+
+#[derive(Debug)]
+struct FetchWaiter {
+    req_id: ReqId,
+    registration: Arc<()>,
+}
+
+impl FetchWaiter {
+    fn take_query(&self, queries: &QueryInner) -> Option<QueryWaiter> {
+        queries
+            .remove_if(&self.req_id, |_, waiter| {
+                Arc::ptr_eq(&waiter.registration, &self.registration)
+            })
+            .map(|(_, waiter)| waiter)
+    }
+}
+
+/// Owns the pending registrations for one request until its future completes or is dropped.
+struct PendingQuery<'a> {
+    sender: &'a WsQuerySender,
+    req_id: ReqId,
+    result_id: Option<ResId>,
+    registration: Arc<()>,
+}
+
+impl Drop for PendingQuery<'_> {
+    fn drop(&mut self) {
+        if let Some(result_id) = self.result_id {
+            self.sender.results.remove_if(&result_id, |_, waiter| {
+                Arc::ptr_eq(&waiter.registration, &self.registration)
+            });
+        }
+        // The reader may have delivered the response already. Keep any newer waiter
+        // registered with the same caller-supplied request ID.
+        self.sender.queries.remove_if(&self.req_id, |_, waiter| {
+            Arc::ptr_eq(&waiter.registration, &self.registration)
+        });
+    }
+}
 
 /// Error used by every "this connection is gone" exit path, so callers can tell a dead
 /// connection (rebuild it) from an ordinary query error (`Code::FAILED`).
@@ -118,66 +170,67 @@ impl WsQuerySender {
         }
 
         let (tx, rx) = query_channel();
+        let registration = Arc::new(());
+        match self.queries.entry(req_id) {
+            Entry::Vacant(slot) => {
+                slot.insert(QueryWaiter {
+                    registration: registration.clone(),
+                    sender: tx,
+                });
+            }
+            Entry::Occupied(_) => {
+                return Err(RawError::from_string(format!(
+                    "request id {req_id} is already in use"
+                )));
+            }
+        }
+        let mut pending = PendingQuery {
+            sender: self,
+            req_id,
+            result_id: None,
+            registration,
+        };
 
-        self.queries.insert(req_id, tx);
+        if let WsSend::FetchBlock(args) = &msg {
+            match self.results.entry(args.id) {
+                Entry::Vacant(slot) => {
+                    slot.insert(FetchWaiter {
+                        req_id,
+                        registration: pending.registration.clone(),
+                    });
+                    pending.result_id = Some(args.id);
+                }
+                Entry::Occupied(_) => {
+                    return Err(RawError::from_string(format!(
+                        "there's a result with id {}",
+                        args.id
+                    )));
+                }
+            }
+        }
 
         // Re-check after registering: the read task may have flipped the flag and swept
         // the pending map between our first check and this insert. Without this second
         // look the entry would sit in the map forever (nothing would ever answer it).
         if self.closed.load(Ordering::Acquire) {
-            self.queries.remove(&req_id);
             return Err(conn_closed("websocket connection is closed"));
         }
 
-        let sent = async {
-            match msg {
-                WsSend::FetchBlock(args) => {
-                    log::trace!("[req id: {req_id}] prepare message {msg:?}");
-                    if self.results.contains_key(&args.id) {
-                        return Err(RawError::from_string(format!(
-                            "there's a result with id {}",
-                            args.id
-                        )));
-                    }
-                    self.results.insert(args.id, args.req_id);
-
-                    self.sender
-                        .send_timeout(msg.to_msg(), send_timeout)
-                        .await
-                        .map_err(Error::from)?;
-                    //
-                }
-                WsSend::Binary(bytes) => {
-                    self.sender
-                        .send_timeout(
-                            WsMessage {
-                                code: OpCode::Binary,
-                                data: bytes.into(),
-                                close_code: None,
-                            },
-                            send_timeout,
-                        )
-                        .await
-                        .map_err(Error::from)?;
-                }
-                _ => {
-                    log::trace!("[req id: {req_id}] prepare  message: {msg:?}");
-                    self.sender
-                        .send_timeout(msg.to_msg(), send_timeout)
-                        .await
-                        .map_err(Error::from)?;
-                }
+        let message = match msg {
+            WsSend::Binary(bytes) => WsMessage {
+                code: OpCode::Binary,
+                data: bytes.into(),
+                close_code: None,
+            },
+            msg => {
+                log::trace!("[req id: {req_id}] prepare message: {msg:?}");
+                msg.to_msg()
             }
-            Ok(())
-        }
-        .await;
-
-        if let Err(err) = sent {
-            // Never reached the wire: drop the pending slot instead of leaving an entry
-            // that nobody will ever answer.
-            self.queries.remove(&req_id);
-            return Err(err);
-        }
+        };
+        self.sender
+            .send_timeout(message, send_timeout)
+            .await
+            .map_err(Error::from)?;
 
         log::trace!("[req id: {req_id}] message sent, wait for receiving");
         match rx.await {
@@ -204,6 +257,12 @@ impl WsQuerySender {
     fn send_blocking(&self, msg: WsSend) -> RawResult<()> {
         let _ = self.sender.blocking_send(msg.to_msg());
         Ok(())
+    }
+
+    fn cancel_fetch(&self, result_id: ResId) {
+        if let Some((_, waiter)) = self.results.remove(&result_id) {
+            waiter.take_query(&self.queries);
+        }
     }
 }
 
@@ -251,6 +310,9 @@ impl Debug for ResultSet {
 
 impl Drop for ResultSet {
     fn drop(&mut self) {
+        // The stored fetch future borrows this ResultSet. Release it while its sender
+        // is still alive so cancellation can remove its pending registrations.
+        drop(self.block_future.take());
         let (sender, closer, args, completed) = (
             self.sender.clone(),
             self.closer.take(),
@@ -258,9 +320,7 @@ impl Drop for ResultSet {
             self.completed,
         );
         let clean = move || {
-            if let Some((_, req_id)) = sender.results.remove(&args.id) {
-                sender.queries.remove(&req_id);
-            }
+            sender.cancel_fetch(args.id);
 
             if !completed {
                 let _ = sender.send_blocking(WsSend::FreeResult(args));
@@ -688,27 +748,20 @@ async fn read_queries(
                                 break 'ws;
                             }
                         };
-                        if let Some((_, req_id)) =  fetches_sender.remove(&res_id) {
-                            if is_v3 {
-                                // v3
-                                if let Some((_, sender)) = queries_sender.remove(&req_id) {
-                                    log::trace!("send data to fetches with id {}", res_id);
-                                    if let Err(err) = sender.send(Ok(WsRecvData::Block { timing, raw: block[offset..].to_vec() })) {
-                                        log::debug!("query {req_id} is gone, drop block frame: {err:?}");
-                                    }
+                        if let Some((_, fetch)) = fetches_sender.remove(&res_id) {
+                            if let Some(sender) = fetch.take_query(&queries_sender) {
+                                log::trace!("send data to fetches with id {}", res_id);
+                                let raw = block[offset..].to_vec();
+                                let data = if is_v3 {
+                                    WsRecvData::Block { timing, raw }
                                 } else {
-                                    log::warn!("req_id {res_id} not detected, message might be lost");
+                                    WsRecvData::BlockV2 { timing, raw }
+                                };
+                                if let Err(err) = sender.send(Ok(data)) {
+                                    log::debug!("query {} is gone, drop block frame: {err:?}", fetch.req_id);
                                 }
                             } else {
-                                // v2
-                                if let Some((_, sender)) = queries_sender.remove(&req_id) {
-                                    log::trace!("send data to fetches with id {}", res_id);
-                                    if let Err(err) = sender.send(Ok(WsRecvData::BlockV2 { timing, raw: block[offset..].to_vec() })) {
-                                        log::debug!("query {req_id} is gone, drop block v2 frame: {err:?}");
-                                    }
-                                } else {
-                                    log::warn!("req_id {res_id} not detected, message might be lost");
-                                }
+                                log::debug!("query {} is gone, drop block for result {res_id}", fetch.req_id);
                             }
                         } else {
                             log::warn!("result id {res_id} not found");
@@ -1505,9 +1558,7 @@ impl ResultSet {
     }
 
     pub async fn stop(&self) {
-        if let Some((_, req_id)) = self.sender.results.remove(&self.args.id) {
-            self.sender.queries.remove(&req_id);
-        }
+        self.sender.cancel_fetch(self.args.id);
 
         let _ = self.sender.send_only(WsSend::FreeResult(self.args)).await;
     }
@@ -1660,6 +1711,128 @@ mod tests {
             req_id,
             sql: "select 1".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_send_releases_pending_waiter() {
+        let (sender, queries, mut outgoing) = test_sender(false);
+        let capacity = sender.sender.max_capacity();
+        for id in 0..capacity {
+            sender.sender.try_send(query(id as u64).to_msg()).unwrap();
+        }
+        assert_eq!(sender.sender.capacity(), 0);
+
+        let req_id = 100;
+        let mut request = Box::pin(sender.send_recv(query(req_id)));
+        assert!(futures::poll!(&mut request).is_pending());
+        assert!(queries.contains_key(&req_id));
+        drop(request);
+
+        assert!(!queries.contains_key(&req_id));
+        for _ in 0..capacity {
+            outgoing.try_recv().unwrap();
+        }
+        assert!(matches!(
+            outgoing.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_reply_leaves_concurrent_query_active() {
+        let (sender, queries, mut outgoing) = test_sender(false);
+        let mut cancelled = Box::pin(sender.send_recv(query(1)));
+        let mut active = Box::pin(sender.send_recv(query(2)));
+        assert!(futures::poll!(&mut cancelled).is_pending());
+        assert!(futures::poll!(&mut active).is_pending());
+        outgoing.try_recv().unwrap();
+        outgoing.try_recv().unwrap();
+
+        drop(cancelled);
+        assert!(!queries.contains_key(&1));
+        let (_, reply) = queries.remove(&2).expect("concurrent request remains registered");
+        reply.send(Ok(WsRecvData::Conn)).unwrap();
+        assert!(matches!(active.await, Ok(WsRecvData::Conn)));
+        assert!(queries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_completed_request_cannot_remove_reused_request_id() {
+        let (sender, queries, mut outgoing) = test_sender(false);
+        let mut first = Box::pin(sender.send_recv(query(3)));
+        assert!(futures::poll!(&mut first).is_pending());
+        outgoing.try_recv().unwrap();
+
+        let duplicate = sender.send_recv(query(3)).await.unwrap_err();
+        assert!(duplicate.to_string().contains("already in use"));
+        let (_, first_reply) = queries.remove(&3).unwrap();
+        first_reply.send(Ok(WsRecvData::Conn)).unwrap();
+
+        let mut next = Box::pin(sender.send_recv(query(3)));
+        assert!(futures::poll!(&mut next).is_pending());
+        outgoing.try_recv().unwrap();
+        assert!(matches!(first.await, Ok(WsRecvData::Conn)));
+        let (_, next_reply) = queries.remove(&3).expect("the newer request owns this ID");
+        next_reply.send(Ok(WsRecvData::Conn)).unwrap();
+        assert!(matches!(next.await, Ok(WsRecvData::Conn)));
+        assert!(queries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_fetch_block_releases_result_mapping() {
+        let (sender, queries, mut outgoing) = test_sender(false);
+        let mut fetch = Box::pin(sender.send_recv(WsSend::FetchBlock(WsResArgs {
+            req_id: 4,
+            id: 20,
+        })));
+        assert!(futures::poll!(&mut fetch).is_pending());
+        outgoing.try_recv().unwrap();
+        assert!(sender.results.contains_key(&20));
+
+        drop(fetch);
+        assert!(sender.results.is_empty());
+        assert!(queries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_block_send_failure_releases_result_mapping() {
+        let (sender, queries, outgoing) = test_sender(false);
+        drop(outgoing);
+
+        let error = sender
+            .send_recv(WsSend::FetchBlock(WsResArgs { req_id: 5, id: 20 }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), WS_ERROR_NO::CONN_CLOSED.as_code());
+        assert!(sender.results.is_empty());
+        assert!(queries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_dropping_result_set_releases_pending_fetch() {
+        let (sender, queries, mut outgoing) = test_sender(false);
+        let mut result = ResultSet {
+            sender,
+            args: WsResArgs { req_id: 90, id: 20 },
+            fields: None,
+            fields_count: 0,
+            affected_rows: 0,
+            precision: Precision::Millisecond,
+            summary: (0, 0),
+            timing: Duration::ZERO,
+            block_future: None,
+            closer: None,
+            completed: false,
+        };
+
+        let mut fetch = futures::future::poll_fn(|cx| AsyncFetchable::fetch_raw_block(&mut result, cx));
+        assert!(futures::poll!(&mut fetch).is_pending());
+        drop(fetch);
+        outgoing.try_recv().unwrap();
+        assert_eq!(queries.len(), 1);
+
+        drop(result);
+        assert!(queries.is_empty());
     }
 
     /// A connection whose read task gave up must reject new requests immediately with
